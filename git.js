@@ -6,9 +6,13 @@
  * Read-only commands only; `GIT_OPTIONAL_LOCKS=0` keeps them from taking the
  * index lock while the user is working.
  *
- * Scope is the badge's scope: staged + unstaged changes against HEAD, plus
- * untracked files (counted as added lines). Deliberately bounded — a huge
- * untracked tree must not turn a hover into a multi-second scan.
+ * Scope is the badge's scope: everything that has not reached the upstream
+ * branch yet — committed-but-unpushed, staged, unstaged — plus untracked files
+ * (counted as added lines). The baseline is the merge base with `@{upstream}`
+ * rather than HEAD, so local commits still count as local changes; see
+ * {@link resolveDiffBase} for why it must be the merge base and not the
+ * upstream tip. Deliberately bounded — a huge untracked tree must not turn a
+ * hover into a multi-second scan.
  */
 import { execFile } from 'node:child_process'
 import { readFile, stat } from 'node:fs/promises'
@@ -81,9 +85,31 @@ async function readBranch(cwd) {
   return hash.ok && sha ? sha : undefined
 }
 
+/**
+ * The commit the badge measures against.
+ *
+ * "Local changes" means anything that has not reached the remote yet, so the
+ * baseline is the fork point with the upstream branch, not HEAD. Comparing
+ * straight against `@{upstream}` would be wrong: when the remote has moved
+ * ahead, its commits show up as *reversed* local changes (other people's work
+ * reported as our deletions). The merge base is the only correct anchor.
+ *
+ * Falls back to HEAD when there is nothing to fork from — no upstream (fresh
+ * `git init`, no remote, detached HEAD) or no commit yet.
+ */
+async function resolveDiffBase(cwd) {
+  const upstream = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
+  const name = upstream.stdout.trim()
+  if (!upstream.ok || name === '') return 'HEAD'
+  const base = await runGit(cwd, ['merge-base', name, 'HEAD'])
+  const sha = base.stdout.trim()
+  return base.ok && sha !== '' ? sha : 'HEAD'
+}
+
 async function readTrackedChanges(cwd) {
-  const againstHead = await runGit(cwd, ['diff', 'HEAD', '--numstat', '-z'])
-  if (againstHead.ok) return parseNumstatZ(againstHead.stdout)
+  const base = await resolveDiffBase(cwd)
+  const against = await runGit(cwd, ['diff', base, '--numstat', '-z'])
+  if (against.ok) return parseNumstatZ(against.stdout)
   // Unborn HEAD (fresh `git init`): fold index-vs-empty and worktree-vs-index.
   const [cached, worktree] = await Promise.all([
     runGit(cwd, ['diff', '--cached', '--numstat', '-z']),
