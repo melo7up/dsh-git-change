@@ -1,0 +1,35 @@
+{
+  "name": "dsh-git-change",
+  "version": "0.1.0",
+  "description": "Git badge in the DSH composer tool row: branch, changed-file count and +added/-deleted lines on hover.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "default": "./index.js"
+    },
+    "./client": {
+      "default": "./client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "git.js",
+    "cordis.patch.yml"
+  ]
+}

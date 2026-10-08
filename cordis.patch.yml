@@ -1,0 +1,4 @@
+# dsh-git-change 的 bundle patch：把自己挂进 DSH 配置树
+- insert:
+    - id: dsh-git-change
+      name: 'dsh-git-change'
