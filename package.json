@@ -1,7 +1,27 @@
 {
   "name": "dsh-git-change",
   "version": "0.1.0",
-  "description": "Git badge in the DSH composer tool row: branch, changed-file count and +added/-deleted lines on hover.",
+  "description": "Git status badge in the DSH composer tool row: branch, changed-file count and +added/-deleted lines on hover.",
+  "license": "MIT",
+  "author": "melo7up",
+  "homepage": "https://github.com/melo7up/dsh-git-change#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/melo7up/dsh-git-change.git"
+  },
+  "bugs": {
+    "url": "https://github.com/melo7up/dsh-git-change/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "git",
+    "git-status",
+    "badge",
+    "composer",
+    "ui"
+  ],
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,6 +33,12 @@
     },
     "./package.json": "./package.json"
   },
+  "files": [
+    "index.js",
+    "client.js",
+    "git.js",
+    "cordis.patch.yml"
+  ],
   "dsh": {
     "manifestVersion": 1,
     "bundle": {
@@ -25,11 +51,5 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4"
-  },
-  "files": [
-    "index.js",
-    "client.js",
-    "git.js",
-    "cordis.patch.yml"
-  ]
+  }
 }

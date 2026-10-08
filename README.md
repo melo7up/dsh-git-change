@@ -2,6 +2,8 @@
 
 DSH 插件：在输入框（composer）工具行右端、模型选择器左侧显示一枚 git 状态角标。
 
+![角标与悬停浮层](docs/badge.png)
+
 - **不在 git 仓库里工作区**：整个图标不渲染（不是灰掉，是不出现）。
 - **默认**：一枚 14px 的灰色分支图标，无圆底。
 - **悬停**：向上弹出浮层 —— 分支名 / 变更文件数 / `+新增` `-删除`（绿/红）。
@@ -18,6 +20,8 @@ DSH 插件：在输入框（composer）工具行右端、模型选择器左侧�
 | `tools/verify-host.mjs` | host 半离线验证（6 项） |
 | `tools/verify-client.mjs` | client bundle 离线验证（5 项：加载协议 / apply / 图标 / 悬停浮层 / 非仓库不渲染） |
 | `tools/asar.mjs`、`tools/asar-grep.mjs` | 读 DSH `app.asar` 的小工具（调研用） |
+| `tools/make-preview.py` | 生成上面那张效果图（PIL 合成，不含任何真实项目内容） |
+| `tools/uninstall.sh` | 一键从 desktop profile 卸载 |
 
 无构建步骤：DSH 的浏览器模块系统只要求 `client.js` 调用一次
 `window.__ModuleLoader__.load({ id, factory })`，且 factory **返回** `module.exports`。
@@ -75,3 +79,7 @@ materialize），再用 jsdom + 真实 React 跑一遍挂载与悬停，因此 b
 - **二进制未跟踪文件**只计文件数，不计行数。
 - **非 live 会话**（历史/归档）拿不到 header，角标不显示。
 - 只读操作：`GIT_OPTIONAL_LOCKS=0`、`GIT_TERMINAL_PROMPT=0`、`LC_ALL=C`，4 秒超时。
+
+## License
+
+[MIT](LICENSE)
