@@ -6,13 +6,10 @@
  * Read-only commands only; `GIT_OPTIONAL_LOCKS=0` keeps them from taking the
  * index lock while the user is working.
  *
- * Scope is the badge's scope: everything that has not reached the upstream
- * branch yet — committed-but-unpushed, staged, unstaged — plus untracked files
- * (counted as added lines). The baseline is the merge base with `@{upstream}`
- * rather than HEAD, so local commits still count as local changes; see
- * {@link resolveDiffBase} for why it must be the merge base and not the
- * upstream tip. Deliberately bounded — a huge untracked tree must not turn a
- * hover into a multi-second scan.
+ * Scope is the badge's scope: the user's own work that has not reached the
+ * upstream branch yet — commits this branch made but has not pushed, plus the
+ * working tree, plus untracked files. Deliberately bounded — a huge untracked
+ * tree must not turn a hover into a multi-second scan.
  */
 import { execFile } from 'node:child_process'
 import { readFile, stat } from 'node:fs/promises'
@@ -22,6 +19,7 @@ const GIT_TIMEOUT_MS = 4000
 const GIT_MAX_BUFFER = 8 * 1024 * 1024
 const MAX_UNTRACKED_FILES = 200
 const MAX_UNTRACKED_FILE_BYTES = 1024 * 1024
+const MAX_UNPUSHED_COMMITS = 200
 const CACHE_TTL_MS = 1500
 
 /** @typedef {{ isRepo: false } | {
@@ -73,6 +71,15 @@ function parseNumstatZ(out) {
   return { files, added, deleted }
 }
 
+/** Add one `--numstat` triple (`added  deleted  path`) to a running total. */
+function addNumstatLine(totals, line) {
+  const match = /^(\d+|-)\t(\d+|-)\t/.exec(line)
+  if (!match) return
+  totals.files += 1
+  if (match[1] !== '-') totals.added += Number(match[1])
+  if (match[2] !== '-') totals.deleted += Number(match[2])
+}
+
 async function readBranch(cwd) {
   const abbrev = await runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])
   const name = abbrev.stdout.trim()
@@ -85,31 +92,10 @@ async function readBranch(cwd) {
   return hash.ok && sha ? sha : undefined
 }
 
-/**
- * The commit the badge measures against.
- *
- * "Local changes" means anything that has not reached the remote yet, so the
- * baseline is the fork point with the upstream branch, not HEAD. Comparing
- * straight against `@{upstream}` would be wrong: when the remote has moved
- * ahead, its commits show up as *reversed* local changes (other people's work
- * reported as our deletions). The merge base is the only correct anchor.
- *
- * Falls back to HEAD when there is nothing to fork from — no upstream (fresh
- * `git init`, no remote, detached HEAD) or no commit yet.
- */
-async function resolveDiffBase(cwd) {
-  const upstream = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
-  const name = upstream.stdout.trim()
-  if (!upstream.ok || name === '') return 'HEAD'
-  const base = await runGit(cwd, ['merge-base', name, 'HEAD'])
-  const sha = base.stdout.trim()
-  return base.ok && sha !== '' ? sha : 'HEAD'
-}
-
-async function readTrackedChanges(cwd) {
-  const base = await resolveDiffBase(cwd)
-  const against = await runGit(cwd, ['diff', base, '--numstat', '-z'])
-  if (against.ok) return parseNumstatZ(against.stdout)
+/** Working tree against HEAD — staged and unstaged together. */
+async function readWorktreeChanges(cwd) {
+  const againstHead = await runGit(cwd, ['diff', 'HEAD', '--numstat', '-z'])
+  if (againstHead.ok) return parseNumstatZ(againstHead.stdout)
   // Unborn HEAD (fresh `git init`): fold index-vs-empty and worktree-vs-index.
   const [cached, worktree] = await Promise.all([
     runGit(cwd, ['diff', '--cached', '--numstat', '-z']),
@@ -118,6 +104,38 @@ async function readTrackedChanges(cwd) {
   const a = parseNumstatZ(cached.stdout)
   const b = parseNumstatZ(worktree.stdout)
   return { files: a.files + b.files, added: a.added + b.added, deleted: a.deleted + b.deleted }
+}
+
+/**
+ * Changes introduced by the commits this branch has not pushed yet.
+ *
+ * Only the first-parent line is walked and merge commits are skipped: a merge
+ * pulls in work that is not the user's, and counting it turns "I merged a
+ * branch" into "I changed 400 lines". Anything already on the upstream falls
+ * outside the range either way, so pulling other people's commits never moves
+ * the badge.
+ *
+ * Trade-off: a file touched by several of these commits accumulates instead of
+ * netting out, which reads more truthfully as "how much did I change here".
+ *
+ * Without an upstream there is nothing to be ahead of, so this reports zero and
+ * the badge falls back to the working tree alone.
+ */
+async function readUnpushedCommitChanges(cwd) {
+  const totals = { files: 0, added: 0, deleted: 0 }
+  const log = await runGit(cwd, [
+    'log',
+    '--first-parent',
+    '--no-merges',
+    '--numstat',
+    '--format=',
+    '-n',
+    String(MAX_UNPUSHED_COMMITS),
+    '@{upstream}..HEAD',
+  ])
+  if (!log.ok) return totals
+  for (const line of log.stdout.split('\n')) addNumstatLine(totals, line)
+  return totals
 }
 
 /** Count lines without materialising a decoding pass; `null` = not countable. */
@@ -150,9 +168,10 @@ export async function collectGitStatus(cwd) {
   const inside = await runGit(cwd, ['rev-parse', '--is-inside-work-tree'])
   if (!inside.ok || inside.stdout.trim() !== 'true') return { isRepo: false }
 
-  const [branch, tracked, untrackedList] = await Promise.all([
+  const [branch, worktree, unpushed, untrackedList] = await Promise.all([
     readBranch(cwd),
-    readTrackedChanges(cwd),
+    readWorktreeChanges(cwd),
+    readUnpushedCommitChanges(cwd),
     runGit(cwd, ['ls-files', '--others', '--exclude-standard', '-z']),
   ])
 
@@ -174,9 +193,9 @@ export async function collectGitStatus(cwd) {
   return {
     isRepo: true,
     branch,
-    filesChanged: tracked.files + untrackedFiles,
-    added: tracked.added + untrackedLines,
-    deleted: tracked.deleted,
+    filesChanged: unpushed.files + worktree.files + untrackedFiles,
+    added: unpushed.added + worktree.added + untrackedLines,
+    deleted: unpushed.deleted + worktree.deleted,
     ...(truncated ? { truncated: true } : {}),
   }
 }
