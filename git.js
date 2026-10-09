@@ -6,13 +6,12 @@
  * Read-only commands only; `GIT_OPTIONAL_LOCKS=0` keeps them from taking the
  * index lock while the user is working.
  *
- * Scope is the badge's scope: everything that has not reached the upstream
- * branch yet — committed-but-unpushed, staged, unstaged — plus untracked files
- * (counted as added lines). The baseline is the merge base with `@{upstream}`
- * rather than HEAD, so local commits still count as local changes; see
- * {@link resolveDiffBase} for why it must be the merge base and not the
- * upstream tip. Deliberately bounded — a huge untracked tree must not turn a
- * hover into a multi-second scan.
+ * Scope is "what I changed on this branch": commits this branch itself made
+ * and has not pushed (first-parent, merges skipped — work a merge brought in
+ * is somebody else's, and reporting it turns "I merged" into "I changed 400
+ * lines"), plus the working tree, plus untracked files. Per file the count is
+ * a net diff between "before my first commit touching it" and "my last one",
+ * so repeated edits of one file do not accumulate.
  */
 import { execFile } from 'node:child_process'
 import { readFile, stat } from 'node:fs/promises'
@@ -22,6 +21,7 @@ const GIT_TIMEOUT_MS = 4000
 const GIT_MAX_BUFFER = 8 * 1024 * 1024
 const MAX_UNTRACKED_FILES = 200
 const MAX_UNTRACKED_FILE_BYTES = 1024 * 1024
+const MAX_OWN_COMMITS = 200
 const CACHE_TTL_MS = 1500
 
 /** @typedef {{ isRepo: false } | {
@@ -54,23 +54,32 @@ function runGit(cwd, args) {
   })
 }
 
-/** Parse `--numstat -z` output (rename entries carry two extra NUL segments). */
+/**
+ * Parse `--numstat -z` output (rename entries carry two extra NUL segments).
+ * Returns the line totals plus the set of paths that actually differ.
+ */
 function parseNumstatZ(out) {
   const parts = out.split('\0')
-  let files = 0
   let added = 0
   let deleted = 0
+  const paths = new Set()
   for (let i = 0; i < parts.length; i++) {
     const seg = parts[i]
     if (!seg) continue
     const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(seg)
     if (!match) continue
-    files += 1
     if (match[1] !== '-') added += Number(match[1])
     if (match[2] !== '-') deleted += Number(match[2])
-    if (match[3] === '') i += 2
+    if (match[3] !== '') {
+      paths.add(match[3])
+    } else {
+      // rename: the next two NUL segments are the old and new path
+      const newPath = parts[i + 2]
+      if (newPath) paths.add(newPath.replace(/^\n/, ''))
+      i += 2
+    }
   }
-  return { files, added, deleted }
+  return { added, deleted, paths }
 }
 
 async function readBranch(cwd) {
@@ -85,39 +94,126 @@ async function readBranch(cwd) {
   return hash.ok && sha ? sha : undefined
 }
 
-/**
- * The commit the badge measures against.
- *
- * "Local changes" means anything that has not reached the remote yet, so the
- * baseline is the fork point with the upstream branch, not HEAD. Comparing
- * straight against `@{upstream}` would be wrong: when the remote has moved
- * ahead, its commits show up as *reversed* local changes (other people's work
- * reported as our deletions). The merge base is the only correct anchor.
- *
- * Falls back to HEAD when there is nothing to fork from — no upstream (fresh
- * `git init`, no remote, detached HEAD) or no commit yet.
- */
-async function resolveDiffBase(cwd) {
-  const upstream = await runGit(cwd, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
-  const name = upstream.stdout.trim()
-  if (!upstream.ok || name === '') return 'HEAD'
-  const base = await runGit(cwd, ['merge-base', name, 'HEAD'])
-  const sha = base.stdout.trim()
-  return base.ok && sha !== '' ? sha : 'HEAD'
-}
-
-async function readTrackedChanges(cwd) {
-  const base = await resolveDiffBase(cwd)
-  const against = await runGit(cwd, ['diff', base, '--numstat', '-z'])
-  if (against.ok) return parseNumstatZ(against.stdout)
+/** Working tree against HEAD — staged and unstaged together. */
+async function readWorktreeChanges(cwd) {
+  const againstHead = await runGit(cwd, ['diff', 'HEAD', '--numstat', '-z'])
+  if (againstHead.ok) return parseNumstatZ(againstHead.stdout)
   // Unborn HEAD (fresh `git init`): fold index-vs-empty and worktree-vs-index.
-  const [cached, worktree] = await Promise.all([
+  const [cached, unstaged] = await Promise.all([
     runGit(cwd, ['diff', '--cached', '--numstat', '-z']),
     runGit(cwd, ['diff', '--numstat', '-z']),
   ])
   const a = parseNumstatZ(cached.stdout)
-  const b = parseNumstatZ(worktree.stdout)
-  return { files: a.files + b.files, added: a.added + b.added, deleted: a.deleted + b.deleted }
+  const b = parseNumstatZ(unstaged.stdout)
+  return {
+    added: a.added + b.added,
+    deleted: a.deleted + b.deleted,
+    paths: new Set([...a.paths, ...b.paths]),
+  }
+}
+
+/**
+ * Commits this branch made but has not pushed, oldest first:
+ * [{ hash, firstParent, files }].
+ *
+ * First-parent only and merges skipped — a merge commit's diff mixes other
+ * people's work with the merge resolution, so it cannot be attributed. The
+ * first parent lets the caller tell consecutive commits from ones separated
+ * by a merge. The \x01 prefix marks hash tokens in the NUL-framed stream.
+ */
+async function readOwnCommits(cwd) {
+  const log = await runGit(cwd, [
+    'log',
+    '--first-parent',
+    '--no-merges',
+    '--format=\x01%H %P',
+    '--name-only',
+    '-z',
+    '-n',
+    String(MAX_OWN_COMMITS),
+    '@{upstream}..HEAD',
+  ])
+  if (!log.ok) return []
+  const commits = []
+  let current = null
+  for (const token of log.stdout.split('\0')) {
+    if (token === '') continue
+    if (token.charCodeAt(0) === 1) {
+      const identity = token.slice(1).split(' ')
+      current = { hash: identity[0], firstParent: identity[1] || null, files: [] }
+      commits.push(current)
+    } else if (current !== null) {
+      current.files.push(token.replace(/^\n/, ''))
+    }
+  }
+  commits.reverse() // git log is newest-first; we walk oldest-first
+  return commits
+}
+
+/**
+ * Net effect of your own unpushed commits, per file counted once.
+ *
+ * For every file your commits touched, its touching commits are split into
+ * runs of consecutive first-parent commits: a run's diff spans the parent of
+ * its first commit to its last, so edits within one run net out. A merge
+ * between two runs breaks the range on purpose — diffing across it would
+ * sweep in whatever the merge brought to that file. Files only a merge
+ * brought in never enter the list and are not queried at all.
+ */
+async function readOwnCommitChanges(cwd) {
+  const totals = { added: 0, deleted: 0, paths: new Set() }
+  const commits = await readOwnCommits(cwd)
+  if (commits.length === 0) return totals
+
+  const touched = new Map() // file -> [commit, ...] oldest-first
+  for (const commit of commits) {
+    for (const file of commit.files) {
+      if (!touched.has(file)) touched.set(file, [])
+      touched.get(file).push(commit)
+    }
+  }
+
+  const groups = new Map() // "from to" -> { from, to, files }
+  for (const [file, list] of touched) {
+    let start = list[0]
+    let end = list[0]
+    const flush = () => {
+      const key = `${start.hash} ${end.hash}`
+      if (!groups.has(key)) groups.set(key, { from: start.hash, to: end.hash, files: [] })
+      groups.get(key).files.push(file)
+    }
+    for (let i = 1; i < list.length; i++) {
+      if (list[i].firstParent === end.hash) {
+        end = list[i]
+      } else {
+        flush()
+        start = end = list[i]
+      }
+    }
+    flush()
+  }
+
+  const diffs = await Promise.all(
+    [...groups.values()].map((group) =>
+      runGit(cwd, [
+        'diff',
+        `${group.from}^`,
+        group.to,
+        '--numstat',
+        '-z',
+        '--',
+        ...group.files,
+      ]),
+    ),
+  )
+  for (const diff of diffs) {
+    if (!diff.ok) continue
+    const part = parseNumstatZ(diff.stdout)
+    totals.added += part.added
+    totals.deleted += part.deleted
+    for (const path of part.paths) totals.paths.add(path)
+  }
+  return totals
 }
 
 /** Count lines without materialising a decoding pass; `null` = not countable. */
@@ -150,9 +246,10 @@ export async function collectGitStatus(cwd) {
   const inside = await runGit(cwd, ['rev-parse', '--is-inside-work-tree'])
   if (!inside.ok || inside.stdout.trim() !== 'true') return { isRepo: false }
 
-  const [branch, tracked, untrackedList] = await Promise.all([
+  const [branch, worktree, own, untrackedList] = await Promise.all([
     readBranch(cwd),
-    readTrackedChanges(cwd),
+    readWorktreeChanges(cwd),
+    readOwnCommitChanges(cwd),
     runGit(cwd, ['ls-files', '--others', '--exclude-standard', '-z']),
   ])
 
@@ -171,12 +268,14 @@ export async function collectGitStatus(cwd) {
     else if (lines === 'oversized') truncated = true
   }
 
+  const files = new Set([...own.paths, ...worktree.paths, ...untrackedPaths])
+
   return {
     isRepo: true,
     branch,
-    filesChanged: tracked.files + untrackedFiles,
-    added: tracked.added + untrackedLines,
-    deleted: tracked.deleted,
+    filesChanged: files.size,
+    added: own.added + worktree.added + untrackedLines,
+    deleted: own.deleted + worktree.deleted,
     ...(truncated ? { truncated: true } : {}),
   }
 }

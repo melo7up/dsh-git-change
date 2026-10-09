@@ -152,17 +152,39 @@ window.__ModuleLoader__.load({
 			React.useEffect(() => {
 				if (sessionId === undefined || connection === undefined) return undefined
 				let alive = true
-				connection.rpc
-					.call(CHANNEL, 'status', { sessionId })
-					.then((response) => {
-						if (!alive) return
-						setStatus(response && response.ok === true ? response.value : null)
-					})
-					.catch(() => {
-						if (alive) setStatus(null)
-					})
+				let attempt = 0
+				let timer = 0
+				// On a cold start the page can mount before the host half has
+				// registered the channel; one failed call used to leave the badge
+				// hidden until something else retriggered the effect. Retry with
+				// backoff instead, so the badge appears as soon as the host is up.
+				const RETRY_DELAYS_MS = [400, 800, 1600, 1600, 1600]
+				const request = () => {
+					connection.rpc
+						.call(CHANNEL, 'status', { sessionId })
+						.then((response) => {
+							if (!alive) return
+							if (response && response.ok === true) {
+								setStatus(response.value)
+								return
+							}
+							scheduleRetry()
+						})
+						.catch(() => scheduleRetry())
+				}
+				const scheduleRetry = () => {
+					if (!alive) return
+					if (attempt >= RETRY_DELAYS_MS.length) {
+							setStatus(null)
+							return
+					}
+					timer = setTimeout(request, RETRY_DELAYS_MS[attempt])
+					attempt += 1
+				}
+				request()
 				return () => {
 					alive = false
+					clearTimeout(timer)
 				}
 			}, [sessionId, connection, sessionStatus, nonce])
 
